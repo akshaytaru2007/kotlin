@@ -14,8 +14,7 @@ import org.jetbrains.kotlin.backend.jvm.codegen.isJvmInterface
 import org.jetbrains.kotlin.backend.jvm.intrinsics.receiverAndArgs
 import org.jetbrains.kotlin.backend.jvm.ir.IrInlineReferenceLocator
 import org.jetbrains.kotlin.backend.jvm.ir.hasJvmDefault
-import org.jetbrains.kotlin.backend.jvm.ir.isLambda
-import org.jetbrains.kotlin.backend.jvm.ir.shouldBeHidden
+import org.jetbrains.kotlin.backend.jvm.lower.inlineclasses.hasMangledParameters
 import org.jetbrains.kotlin.descriptors.Modality
 import org.jetbrains.kotlin.descriptors.Visibilities
 import org.jetbrains.kotlin.descriptors.Visibility
@@ -57,20 +56,30 @@ internal class SyntheticAccessorLowering(val context: JvmBackendContext) : IrEle
             return super.visitFunctionAccess(expression)
         }
 
+        val callee = expression.symbol.owner
         val withSuper = (expression as? IrCall)?.superQualifierSymbol != null
         val thisSymbol = (expression as? IrCall)?.dispatchReceiver?.type?.classifierOrNull as? IrClassSymbol
-        if (expression.symbol.isAccessible(withSuper, thisSymbol)) {
-            return super.visitFunctionAccess(expression)
-        }
-        return super.visitExpression(
-            modifyFunctionAccessExpression(expression, functionMap.getOrPut(expression.symbol) {
-                when (val symbol = expression.symbol) {
-                    is IrConstructorSymbol -> symbol.owner.makeConstructorAccessor().symbol
-                    is IrSimpleFunctionSymbol -> symbol.owner.makeSimpleFunctionAccessor(expression as IrCall).symbol
-                    else -> error("Unknown subclass of IrFunctionSymbol")
+
+        val accessor = when {
+            callee is IrConstructor && callee.isOrShouldBeHidden ->
+                getAccessorForHiddenConstructor(callee).symbol
+
+            !expression.symbol.isAccessible(withSuper, thisSymbol) ->
+                functionMap.getOrPut(expression.symbol) {
+                    when (val symbol = expression.symbol) {
+                        is IrConstructorSymbol -> symbol.owner.makeConstructorAccessor().also { accessor ->
+                            pendingTransformations.add {
+                                (accessor.parent as IrDeclarationContainer).declarations.add(accessor)
+                            }
+                        }.symbol
+                        is IrSimpleFunctionSymbol -> symbol.owner.makeSimpleFunctionAccessor(expression as IrCall).symbol
+                        else -> error("Unknown subclass of IrFunctionSymbol")
+                    }
                 }
-            })
-        )
+
+            else -> return super.visitFunctionAccess(expression)
+        }
+        return super.visitExpression(modifyFunctionAccessExpression(expression, accessor))
     }
 
     override fun visitGetField(expression: IrGetField) = super.visitExpression(
@@ -90,54 +99,40 @@ internal class SyntheticAccessorLowering(val context: JvmBackendContext) : IrEle
     )
 
     override fun visitConstructor(declaration: IrConstructor): IrStatement {
-        handleHiddenConstructor(declaration)
-        return super.visitConstructor(declaration)
-    }
-
-    override fun visitConstructorCall(expression: IrConstructorCall): IrExpression {
-        handleHiddenConstructor(expression.symbol.owner)
-        return super.visitConstructorCall(expression)
-    }
-
-    override fun visitFunctionReference(expression: IrFunctionReference): IrExpression {
-        val function = expression.symbol.owner
-
-        if (!expression.origin.isLambda && function is IrConstructor) {
-            handleHiddenConstructor(function)?.let { accessor ->
-                expression.transformChildrenVoid()
-                return IrFunctionReferenceImpl(
-                    expression.startOffset, expression.endOffset, expression.type,
-                    accessor, accessor.owner.typeParameters.size,
-                    accessor.owner.valueParameters.size, expression.origin
-                )
+        if (declaration.isOrShouldBeHidden) {
+            pendingTransformations.add {
+                declaration.parentAsClass.declarations.add(getAccessorForHiddenConstructor(declaration))
             }
         }
 
-        return super.visitFunctionReference(expression)
+        return super.visitConstructor(declaration)
     }
 
-    private fun handleHiddenConstructor(declaration: IrConstructor): IrConstructorSymbol? {
-        functionMap[declaration.symbol]?.let { return it as IrConstructorSymbol }
+    private val IrConstructor.isOrShouldBeHidden: Boolean
+        get() = this in context.hiddenConstructors || (
+                !Visibilities.isPrivate(visibility) && !constructedClass.isInline && hasMangledParameters &&
+                        origin != IrDeclarationOrigin.FUNCTION_FOR_DEFAULT_PARAMETER &&
+                        origin != JvmLoweredDeclarationOrigin.SYNTHETIC_ACCESSOR)
 
-        if (!declaration.shouldBeHidden)
-            return null
+    private fun getAccessorForHiddenConstructor(constructor: IrConstructor): IrConstructorImpl {
+        require(constructor.isOrShouldBeHidden, constructor::render)
+        return context.hiddenConstructors.getOrPut(constructor) {
+            // TODO: avoid modifying elements from other files here
+            constructor.visibility = Visibilities.PRIVATE
 
-        declaration.visibility = Visibilities.PRIVATE
-
-        return declaration.makeConstructorAccessor().also { accessor ->
-            functionMap[declaration.symbol] = accessor.symbol
-
-            // There's a special case in the JVM backend for serializing the metadata of hidden
-            // constructors - we serialize the descriptor of the original constructor, but the
-            // signature of the bridge. We implement this special case in the JVM IR backend by
-            // attaching the metadata directly to the bridge. We also have to move all annotations
-            // to the bridge method. Parameter annotations are already moved by the copyTo method.
-            accessor.metadata = declaration.metadata
-            declaration.safeAs<IrConstructorImpl>()?.metadata = null
-            accessor.annotations += declaration.annotations
-            declaration.annotations.clear()
-            declaration.valueParameters.forEach { it.annotations.clear() }
-        }.symbol
+            constructor.makeConstructorAccessor().also { accessor ->
+                // There's a special case in the JVM backend for serializing the metadata of hidden
+                // constructors - we serialize the descriptor of the original constructor, but the
+                // signature of the accessor. We implement this special case in the JVM IR backend by
+                // attaching the metadata directly to the accessor. We also have to move all annotations
+                // to the accessor. Parameter annotations are already moved by the copyTo method.
+                accessor.metadata = constructor.metadata
+                constructor.safeAs<IrConstructorImpl>()?.metadata = null
+                accessor.annotations += constructor.annotations
+                constructor.annotations.clear()
+                constructor.valueParameters.forEach { it.annotations.clear() }
+            }
+        }
     }
 
     // In case of Java `protected static`, access could be done from a public inline function in the same package,
@@ -155,10 +150,8 @@ internal class SyntheticAccessorLowering(val context: JvmBackendContext) : IrEle
             origin = JvmLoweredDeclarationOrigin.SYNTHETIC_ACCESSOR
             name = source.name
             visibility = Visibilities.PUBLIC
-
         }.also { accessor ->
             accessor.parent = source.parent
-            pendingTransformations.add { (accessor.parent as IrDeclarationContainer).declarations.add(accessor) }
 
             accessor.copyTypeParametersFrom(source, JvmLoweredDeclarationOrigin.SYNTHETIC_ACCESSOR)
             accessor.copyValueParametersToStatic(source, JvmLoweredDeclarationOrigin.SYNTHETIC_ACCESSOR)
