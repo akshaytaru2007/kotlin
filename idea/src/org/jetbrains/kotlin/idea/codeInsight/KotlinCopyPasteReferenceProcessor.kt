@@ -51,7 +51,6 @@ import org.jetbrains.kotlin.idea.references.*
 import org.jetbrains.kotlin.idea.util.ImportInsertHelper
 import org.jetbrains.kotlin.idea.util.ProgressIndicatorUtils
 import org.jetbrains.kotlin.idea.util.application.executeWriteCommand
-import org.jetbrains.kotlin.idea.util.application.runWriteAction
 import org.jetbrains.kotlin.idea.util.getFileResolutionScope
 import org.jetbrains.kotlin.idea.util.getSourceRoot
 import org.jetbrains.kotlin.incremental.components.NoLookupLocation
@@ -106,7 +105,7 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
         val endOfImportsOffset = file.importDirectives.map { it.endOffset }.max() ?: file.packageDirective?.endOffset ?: 0
         val text = file.text.substring(endOfImportsOffset)
 
-        val textBlocks = ranges.map { textRange ->
+        val textBlockReferenceCandidates = ranges.map { textRange ->
             val refElementsRanges = mutableListOf<TextRange>()
             val elementsInRange = file.elementsInRange(textRange).filter { it is KtElement || it is KDocElement }
             elementsInRange.forEach { element ->
@@ -124,18 +123,6 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
                 refElementsRanges.toList()
             )
         }
-////        // TODO: leftover
-//        val collectedData = try {
-//            collectReferenceData(file, startOffsets, endOffsets)
-//        } catch (e: ProcessCanceledException) {
-//            // supposedly analysis can only be canceled from another thread
-//            // do not log ProcessCanceledException as it is rethrown by IdeaLogger and code won't be copied
-//            LOG.debug("ProcessCanceledException while analyzing references in ${file.getName()}. References can't be processed.")
-//            return listOf()
-//        } catch (e: Throwable) {
-//            LOG.error("Exception in processing references for copy paste in file ${file.getName()}}", e)
-//            return listOf()
-//        }
 
         return listOf(
             BasicKotlinReferenceTransferableData(
@@ -144,15 +131,32 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
                 imports = imports,
                 endOfImportsOffset = endOfImportsOffset,
                 sourceText = text,
-                textBlockReferenceCandidates = textBlocks
+                textBlockReferenceCandidates = textBlockReferenceCandidates
             )
         )
+    }
+
+    private fun collectReferenceData(
+        textBlocks: List<TextBlock>,
+        file: KtFile,
+        targetFile: KtFile,
+        fakePackageName: String,
+        sourcePackageName: String
+    ): List<KotlinReferenceData> {
+        val targetPackageName = targetFile.packageDirective?.fqName?.asString() ?: ""
+        val startOffsets = textBlocks.map { it.startOffset }.toIntArray()
+        val endOffsets = textBlocks.map { it.endOffset }.toIntArray()
+
+        return collectReferenceData(file, startOffsets, endOffsets, fakePackageName, sourcePackageName, targetPackageName)
     }
 
     fun collectReferenceData(
         file: KtFile,
         startOffsets: IntArray,
-        endOffsets: IntArray
+        endOffsets: IntArray,
+        fakePackageName: String? = null,
+        sourcePackageName: String? = null,
+        targetPackageName: String? = null
     ): List<KotlinReferenceData> {
         val ranges = toTextRanges(startOffsets, endOffsets)
         val elementsByRange = ranges.associateBy({ it }, { textRange ->
@@ -165,10 +169,13 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
                 file.getResolutionFacade().analyze(allElementsToResolve, BodyResolveMode.PARTIAL)
             }
 
-        val result = ArrayList<KotlinReferenceData>()
+        val result = mutableListOf<KotlinReferenceData>()
         for ((range, elements) in elementsByRange) {
             for (element in elements) {
-                result.addReferenceDataInsideElement(element, file, range.start, startOffsets, endOffsets, bindingContext)
+                result.addReferenceDataInsideElement(
+                    element, file, range.start, ranges, bindingContext,
+                    fakePackageName = fakePackageName, sourcePackageName = sourcePackageName, targetPackageName = targetPackageName
+                )
             }
         }
         return result
@@ -178,8 +185,7 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
         element: PsiElement,
         file: KtFile,
         startOffset: Int,
-        startOffsets: IntArray,
-        endOffsets: IntArray,
+        textRanges: List<TextRange>,
         bindingContext: BindingContext,
         fakePackageName: String? = null,
         sourcePackageName: String? = null,
@@ -199,7 +205,7 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
                 val declaration = effectiveReferencedDescriptors
                     .map { DescriptorToSourceUtils.getSourceFromDescriptor(it) }
                     .singleOrNull()
-                if (declaration != null && declaration.isInCopiedArea(file, startOffsets, endOffsets)) continue
+                if (declaration != null && declaration.isInCopiedArea(file, textRanges)) continue
 
                 if (!reference.canBeResolvedViaImport(descriptor, bindingContext)) continue
 
@@ -250,21 +256,46 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
         processReferenceData(project, file, bounds.startOffset, values.single())
     }
 
-    fun processReferenceData(project: Project, file: KtFile, blockStart: Int, transferableData: BasicKotlinReferenceTransferableData) {
+    private fun processReferenceData(
+        project: Project,
+        file: KtFile,
+        blockStart: Int,
+        transferableData: BasicKotlinReferenceTransferableData
+    ) {
         PsiDocumentManager.getInstance(project).commitAllDocuments()
-
-        val references = transferableData.textBlockReferenceCandidates.map { candidates ->
-            candidates.referenceCandidates.mapNotNull {
+        val references = transferableData.textBlockReferenceCandidates.flatMap { candidates ->
+            candidates.referenceCandidateRanges.mapNotNull {
                 val ref = findReference(
                     file, TextRange(
                         blockStart + it.startOffset - candidates.textBlock.startOffset,
                         blockStart + it.endOffset - candidates.textBlock.startOffset
                     )
-                )
-                ref
+                ) ?: return@mapNotNull null
+                TextRange(ref.element.startOffset, ref.element.endOffset) to ref
             }
         }
 
+        processReferenceData(project, file) {
+            findReferenceDataToRestore(
+                file,
+                blockStart,
+                references.toMap(),
+                transferableData
+            )
+        }
+    }
+
+    fun processReferenceData(project: Project, file: KtFile, blockStart: Int, referenceData: Array<KotlinReferenceData>) {
+        processReferenceData(project, file) {
+            findReferencesToRestore(file, blockStart, referenceData)
+        }
+    }
+
+    private fun processReferenceData(
+        project: Project,
+        file: KtFile,
+        findReferenceDataToRestore: () -> List<ReferenceToRestoreData>
+    ) {
         val task: Task.Backgroundable = object : Task.Backgroundable(project, "Resolve pasted references", true) {
             override fun run(indicator: ProgressIndicator) {
                 assert(!ApplicationManager.getApplication().isWriteAccessAllowed) {
@@ -272,11 +303,7 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
                 }
                 ProgressIndicatorUtils.awaitWithCheckCanceled(
                     nonBlocking<List<ReferenceToRestoreData>> {
-                        return@nonBlocking findReferenceDataToRestore(
-                            file,
-                            blockStart,
-                            transferableData
-                        )
+                        return@nonBlocking findReferenceDataToRestore()
                     }
                         .finishOnUiThread(
                             ModalityState.defaultModalityState(),
@@ -298,24 +325,10 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
         ProgressManager.getInstance().run(task)
     }
 
-    fun processReferenceData(project: Project, file: KtFile, blockStart: Int, referenceData: Array<KotlinReferenceData>) {
-        PsiDocumentManager.getInstance(project).commitAllDocuments()
-
-        val referencesPossibleToRestore =
-            findReferencesToRestore(file, blockStart, referenceData)
-
-        val selectedReferencesToRestore =
-            showRestoreReferencesDialog(project, referencesPossibleToRestore)
-        if (selectedReferencesToRestore.isEmpty()) return
-
-        runWriteAction {
-            restoreReferences(selectedReferencesToRestore, file)
-        }
-    }
-
     private fun findReferenceDataToRestore(
         file: PsiFile,
         blockStart: Int,
+        referencesByPosition: Map<TextRange, KtReference>,
         transferableData: BasicKotlinReferenceTransferableData
     ): List<ReferenceToRestoreData> {
         if (file !is KtFile) return emptyList()
@@ -355,12 +368,10 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
 
         // Step 1. Find references in copied blocks of (recreated) source file
         val sourceFileBasedReferences =
-            dummyOriginalFileTextBlocks.flatMap {
-                findReferences(it, dummyOriginalFileTextBlocks, dummyOriginalFile, file, fakePkgName, sourcePkgName)
-            }
+            collectReferenceData(dummyOriginalFileTextBlocks, dummyOriginalFile, file, fakePkgName, sourcePkgName)
 
         // Step 2. Find references to restore in a target file
-        return findReferencesToRestore(file, blockStart, sourceFileBasedReferences.toTypedArray())
+        return findReferencesToRestore(file, blockStart, sourceFileBasedReferences.toTypedArray(), referencesByPosition)
     }
 
     private fun buildDummySourceScope(
@@ -449,8 +460,30 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
     ): List<ReferenceToRestoreData> {
         if (file !is KtFile) return listOf()
 
-        val references = referenceData
-            .map { it to findReference(it, file, blockStart) }
+        return findReferences(file, referenceData.map { it to findReference(it, file, blockStart) })
+    }
+
+    private fun findReferencesToRestore(
+        file: PsiFile,
+        blockStart: Int,
+        referenceData: Array<out KotlinReferenceData>,
+        referencesByPosition: Map<TextRange, KtReference>
+    ): List<ReferenceToRestoreData> {
+        if (file !is KtFile) return listOf()
+
+        // use already found reference candidates - so file could be changed
+        return findReferences(file, referenceData
+            .map {
+                val textRange = TextRange(it.startOffset + blockStart, it.endOffset + blockStart)
+                val reference = referencesByPosition[textRange]
+                it to if (reference?.let { ref -> ref.element.isValid } == true) reference else null
+            })
+    }
+
+    private fun findReferences(
+        file: KtFile,
+        references: List<Pair<KotlinReferenceData, KtReference?>>
+    ): List<ReferenceToRestoreData> {
         val bindingContext = try {
             file.getResolutionFacade().analyze(references.mapNotNull { it.second?.element }, BodyResolveMode.PARTIAL)
         } catch (e: Throwable) {
@@ -477,61 +510,15 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
         return findReference(element, desiredRange)
     }
 
-    private fun findReference(element: PsiElement, desiredRange: TextRange, ignoreElementRange: Boolean = false): KtReference? {
+    private fun findReference(element: PsiElement, desiredRange: TextRange): KtReference? {
         for (current in element.parentsWithSelf) {
             val range = current.range
-            if (current is KtElement && (ignoreElementRange || range == desiredRange)) {
+            if (current is KtElement && range == desiredRange) {
                 current.mainReference?.let { return it }
             }
             if (range !in desiredRange) return null
         }
         return null
-    }
-
-    private fun findReferences(
-        data: TextBlock,
-        textBlocks: List<TextBlock>,
-        file: KtFile,
-        targetFile: KtFile,
-        fakePackageName: String,
-        sourcePackageName: String
-    ): List<KotlinReferenceData> {
-        val targetPackageName = targetFile.packageDirective?.fqName?.asString() ?: ""
-        val textRange = TextRange(data.startOffset, data.endOffset)
-
-        val startOffsets = textBlocks.map { it.startOffset }.toIntArray()
-        val endOffsets = textBlocks.map { it.endOffset }.toIntArray()
-
-        val elementsInRange = file.elementsInRange(textRange).filter { it is KtElement || it is KDocElement }
-
-        val allElementsInRange = elementsInRange.flatMap { it.collectDescendantsOfType<KtElement>() }
-
-        val bindingContext =
-            file.getResolutionFacade().analyze(allElementsInRange, BodyResolveMode.PARTIAL)
-
-        val resolvedReferences = mutableListOf<KotlinReferenceData>()
-
-        elementsInRange.forEach { element ->
-            element.forEachDescendantOfType<KtElement>(canGoInside = {
-                it::class.java as Class<*> !in IGNORE_REFERENCES_INSIDE
-            }) { ktElement ->
-                resolvedReferences
-                    .addReferenceDataInsideElement(
-                        ktElement, file, data.startOffset, startOffsets, endOffsets, bindingContext,
-                        fakePackageName = fakePackageName, sourcePackageName = sourcePackageName, targetPackageName = targetPackageName
-                    )
-            }
-        }
-
-        return resolvedReferences.filter { referenceData ->
-            // check that descriptor to import exists and is accessible from the current module
-            val importableDescriptors = findImportableDescriptors(FqName(referenceData.fqName), targetFile)
-            if (importableDescriptors.none { KotlinReferenceData.Kind.fromDescriptor(it) == referenceData.kind }) {
-                return@filter false
-            }
-
-            true
-        }
     }
 
     private fun createReferenceToRestoreData(
@@ -651,9 +638,9 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
         return startOffsets.indices.map { TextRange(startOffsets[it], endOffsets[it]) }
     }
 
-    private fun PsiElement.isInCopiedArea(fileCopiedFrom: KtFile, startOffsets: IntArray, endOffsets: IntArray): Boolean {
+    private fun PsiElement.isInCopiedArea(fileCopiedFrom: KtFile, textRanges: List<TextRange>): Boolean {
         if (containingFile != fileCopiedFrom) return false
-        return toTextRanges(startOffsets, endOffsets).any { this.range in it }
+        return textRanges.any { this.range in it }
     }
 
     companion object {

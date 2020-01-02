@@ -11,7 +11,7 @@ import java.awt.datatransfer.DataFlavor
 import java.io.Serializable
 
 data class TextBlock(val startOffset: Int, val endOffset: Int, val text: String)
-data class TextBlockReferenceCandidates(val textBlock: TextBlock, val referenceCandidates: List<TextRange>)
+data class TextBlockReferenceCandidates(val textBlock: TextBlock, val referenceCandidateRanges: List<TextRange>)
 
 class BasicKotlinReferenceTransferableData(
     val sourceFileUrl: String,
